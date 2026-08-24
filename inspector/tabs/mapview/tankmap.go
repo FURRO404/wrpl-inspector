@@ -11,11 +11,59 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
+	"slices"
+
+	"github.com/maxsupermanhd/wrpl-inspector/v3/wtcontent"
 )
 
-func levelToTankmap(tankmapsPath, level string) (*image.RGBA, error) {
-	fname := strings.TrimSuffix(strings.TrimPrefix(level, `levels/`), `.bin`) + `_tankmap.png`
+// levelToMinimap loads a minimap picture for a level and reports which kind it
+// took. A level can have a ground picture, an air picture, or both, and each
+// kind has its own coordinate pair, so a kind the level gives no coordinates
+// for is skipped. Pass an empty want to take the ground picture when there is
+// one and the air picture otherwise.
+//
+// A War Thunder installation is tried first. Without one the ground picture
+// comes from a cache directory, and failing that from the WtMiniMapPictures
+// repository. That fallback has no air pictures.
+func levelToMinimap(inst *wtcontent.Install, tankmapsPath, level string, offsets levelDef, want wtcontent.MapKind) (*image.RGBA, wtcontent.MapKind, error) {
+	kinds := []wtcontent.MapKind{wtcontent.MapGround, wtcontent.MapAir}
+	if want != "" {
+		kinds = []wtcontent.MapKind{want}
+	}
+	// Drop the kinds this level gives no coordinates for.
+	kinds = slices.DeleteFunc(kinds, func(kind wtcontent.MapKind) bool {
+		_, _, ok := offsets.coordsFor(kind)
+		return !ok
+	})
+	if len(kinds) == 0 {
+		return nil, "", fmt.Errorf("level %q describes no minimap coordinates", level)
+	}
+
+	var errs []error
+	if inst != nil {
+		for _, kind := range kinds {
+			im, _, err := inst.LevelMap(level, kind)
+			if err == nil {
+				return im, kind, nil
+			}
+			errs = append(errs, err)
+		}
+	}
+	// The download fallback holds ground pictures only.
+	if slices.Contains(kinds, wtcontent.MapGround) {
+		im, err := downloadedTankmap(tankmapsPath, level)
+		if err == nil {
+			return im, wtcontent.MapGround, nil
+		}
+		errs = append(errs, err)
+	}
+	return nil, "", errors.Join(errs...)
+}
+
+// downloadedTankmap loads the ground picture from the cache directory, and
+// fetches it from the WtMiniMapPictures repository when the cache misses.
+func downloadedTankmap(tankmapsPath, level string) (*image.RGBA, error) {
+	fname := wtcontent.LevelName(level) + `_tankmap.png`
 	p := filepath.Join(tankmapsPath, fname)
 	f, err := os.ReadFile(p)
 	if err != nil {

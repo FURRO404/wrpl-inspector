@@ -3,6 +3,7 @@ package wtcontent
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -36,7 +37,7 @@ func ReadVROMFS(raw []byte) (*VROMFS, error) {
 		return nil, fmt.Errorf("unknown header %q", magic)
 	}
 	if ret.Pack>>26 == 0x20 { // stored as is, every other packing is zstd
-		content, err := vromfsAt(body, 0, int(binary.LittleEndian.Uint32(raw[8:12])))
+		content, err := sliceAt(body, 0, int(binary.LittleEndian.Uint32(raw[8:12])))
 		if err != nil {
 			return nil, err
 		}
@@ -46,7 +47,6 @@ func ReadVROMFS(raw []byte) (*VROMFS, error) {
 		return ret, nil
 	}
 	if size := int(ret.Pack & 0x03FFFFFF); size > 0 && size <= len(body) {
-		fmt.Println("body", len(body), size, len(body)-size)
 		body = body[:size] // an md5 digest can follow the image
 	}
 	imgReader, err := zstd.NewReader(bytes.NewBuffer(vromfsDeobfuscate(body)))
@@ -64,10 +64,9 @@ func ReadVROMFS(raw []byte) (*VROMFS, error) {
 	namesAt := int(binary.LittleEndian.Uint32(img[0:4]))
 	namesCount := int(binary.LittleEndian.Uint32(img[4:8]))
 	dataAt := int(binary.LittleEndian.Uint32(img[16:20]))
-	fmt.Println("names", namesAt, namesCount, "data", dataAt)
 	ret.Files = map[string][]byte{}
 	for i := range namesCount {
-		p, err := vromfsAt(img, namesAt+i*8, 8)
+		p, err := sliceAt(img, namesAt+i*8, 8)
 		if err != nil {
 			return nil, err
 		}
@@ -81,11 +80,11 @@ func ReadVROMFS(raw []byte) (*VROMFS, error) {
 		}
 		name := string(img[at : at+end])
 		// A file record is 4 u32, only the offset and the size are used.
-		rec, err := vromfsAt(img, dataAt+i*16, 16)
+		rec, err := sliceAt(img, dataAt+i*16, 16)
 		if err != nil {
 			return nil, err
 		}
-		content, err := vromfsAt(img,
+		content, err := sliceAt(img,
 			int(binary.LittleEndian.Uint32(rec[0:4])),
 			int(binary.LittleEndian.Uint32(rec[4:8])))
 		if err != nil {
@@ -97,6 +96,21 @@ func ReadVROMFS(raw []byte) (*VROMFS, error) {
 		ret.Files[name] = content
 	}
 	return ret, nil
+}
+
+// NameMapEntry is the name of the vromfs entry that holds the shared name map.
+const NameMapEntry = "\xff?nm"
+
+// Dict returns the shared zstd dictionary this image compresses its
+// SLIM_ZSTD_DICT BLKs against, or nil when the image has none. The name map
+// entry carries the dictionary digest at bytes 8..40, and the dictionary is
+// stored under the hex form of that digest with a ".dict" suffix.
+func (v *VROMFS) Dict() []byte {
+	nm := v.Files[NameMapEntry]
+	if len(nm) < 40 {
+		return nil
+	}
+	return v.Files[hex.EncodeToString(nm[8:40])+".dict"]
 }
 
 // vromfsDeobfuscate xors the first and the last 16 bytes of a packed image.
@@ -122,7 +136,9 @@ func vromfsDeobfuscate(data []byte) []byte {
 	return out
 }
 
-func vromfsAt(b []byte, offset, size int) ([]byte, error) {
+// sliceAt returns size bytes of b at offset, or an error when that range is
+// not inside b.
+func sliceAt(b []byte, offset, size int) ([]byte, error) {
 	if offset < 0 || size < 0 || offset+size > len(b) {
 		return nil, fmt.Errorf("offset %d size %d is out of %d bytes", offset, size, len(b))
 	}

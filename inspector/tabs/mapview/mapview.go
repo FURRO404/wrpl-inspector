@@ -22,6 +22,7 @@ import (
 	packetkill "github.com/maxsupermanhd/wrpl-inspector/v3/wrpl/packet/parser/kill"
 	packetmovement "github.com/maxsupermanhd/wrpl-inspector/v3/wrpl/packet/parser/movement"
 	packetslot "github.com/maxsupermanhd/wrpl-inspector/v3/wrpl/packet/parser/slot"
+	"github.com/maxsupermanhd/wrpl-inspector/v3/wtcontent"
 )
 
 type MapViewTab struct {
@@ -33,24 +34,30 @@ type MapViewTab struct {
 	Paths        *packetmovement.PositionRetainerParser
 	CameraAngles *packetcameraangles.PacketCameraAnglesParser
 
+	// Install is an optional War Thunder installation. When it is set, the
+	// map picture and the level and mission definitions come from it, and
+	// the two paths below are only a fallback.
+	Install      *wtcontent.Install
 	TankMapsPath string
 	DataminePath string
+	// MapKind forces one minimap kind. Leave it empty to take the ground
+	// picture when the level has one and the air picture otherwise.
+	MapKind wtcontent.MapKind
 
-	initErr         error
-	tankmapTextureW int
-	tankmapTextureH int
-	tankmapTexture  *imgui.TextureRef
-	rLevel          string
-	rLevelSettings  string
-	rBattleType     string
-	rAreas          map[string]AreaDef
-	rMission        MissionDef
-	rOffsets        levelDef
-	rMainAreaName   string
-	rImageArea      image.Rectangle
-	rCaps           map[int]AreaDef
-	rCoordScaleX    float64
-	rCoordScaleZ    float64
+	initErr        error
+	tankmapTexture *imgui.TextureRef
+	rLevel         string
+	rLevelSettings string
+	rBattleType    string
+	rAreas         map[string]AreaDef
+	rMission       MissionDef
+	rOffsets       levelDef
+	rMapKind       wtcontent.MapKind
+	rMainAreaName  string
+	rImageArea     image.Rectangle
+	rCaps          map[int]AreaDef
+	rCoordScaleX   float64
+	rCoordScaleZ   float64
 
 	highlightPath     uint64
 	hoveredPath       uint64
@@ -88,17 +95,36 @@ func (tab *MapViewTab) Init() {
 	tab.rLevelSettings = string(bytes.Trim(tab.Rpl.Header.Raw_LevelSettings[:], "\x00"))
 	tab.rBattleType = string(bytes.Trim(tab.Rpl.Header.Raw_BattleType[:], "\x00"))
 
-	tankmapImage, err := levelToTankmap(tab.TankMapsPath, tab.rLevel)
+	// The level defines one coordinate pair per minimap kind, so the picture
+	// has to be chosen before anything is placed on it.
+	offsets, err := getLevelCoords(tab.Install, tab.DataminePath, tab.rLevel)
 	if err != nil {
-		tankmapImage = image.NewRGBA(image.Rect(0, 0, 2048, 2048))
-		tab.initErr = fmt.Errorf("levelToTankmap: %w", err)
+		tab.initErr = fmt.Errorf("getLevelCoords: %w", err)
+		return
 	}
-	tab.tankmapTextureW = tankmapImage.Rect.Dx()
-	tab.tankmapTextureH = tankmapImage.Rect.Dy()
+
+	tankmapImage, kind, err := levelToMinimap(tab.Install, tab.TankMapsPath, tab.rLevel, *offsets, tab.MapKind)
+	if err != nil {
+		// Draw the overlay on a blank picture, using whichever coordinates
+		// the level does describe.
+		tankmapImage = image.NewRGBA(image.Rect(0, 0, tankmapSpace, tankmapSpace))
+		kind = wtcontent.MapGround
+		if _, _, ok := offsets.coordsFor(kind); !ok {
+			kind = wtcontent.MapAir
+		}
+		tab.initErr = fmt.Errorf("levelToMinimap: %w", err)
+	}
+	if !offsets.useMap(kind) {
+		tab.initErr = fmt.Errorf("level %q has no %s coordinates", tab.rLevel, kind)
+		return
+	}
+	tab.rMapKind = kind
+	tab.rOffsets = *offsets
+
 	tex := tab.Backend.CreateTextureRgba(tankmapImage, tankmapImage.Rect.Dx(), tankmapImage.Rect.Dy())
 	tab.tankmapTexture = &tex
 
-	mission, err := missionLoad(tab.DataminePath, tab.rLevelSettings)
+	mission, err := missionLoad(tab.Install, tab.DataminePath, tab.rLevelSettings)
 	if err != nil {
 		tab.initErr = fmt.Errorf("missionLoad: %w", err)
 		return
@@ -110,13 +136,6 @@ func (tab *MapViewTab) Init() {
 		areas = mission.Areas
 	}
 	tab.rAreas = areas
-
-	offsets, err := getLevelCoords(tab.DataminePath, tab.rLevel)
-	if err != nil {
-		tab.initErr = fmt.Errorf("getLevelCoords: %w", err)
-		return
-	}
-	tab.rOffsets = *offsets
 
 	mainArea, mainAreaName, err := findMainBattleArea(areas, tab.rBattleType, tab.Rpl.Header.Difficulty)
 	if err != nil {
@@ -133,8 +152,8 @@ func (tab *MapViewTab) Init() {
 	}
 	tab.rCaps = caps
 
-	tab.rCoordScaleX = math.Abs(offsets.TankMapCoord1[0]-offsets.TankMapCoord0[0]) / 2048
-	tab.rCoordScaleZ = math.Abs(offsets.TankMapCoord1[1]-offsets.TankMapCoord0[1]) / 2048
+	tab.rCoordScaleX = math.Abs(offsets.Coord1[0]-offsets.Coord0[0]) / tankmapSpace
+	tab.rCoordScaleZ = math.Abs(offsets.Coord1[1]-offsets.Coord0[1]) / tankmapSpace
 
 	tab.pbCurrentTime = tab.Rpl.Packets[0].CurrentTime
 	tab.pbPlaybackSpeed = 1
@@ -266,8 +285,10 @@ func (tab *MapViewTab) RunControls() {
 func (tab *MapViewTab) DrawView() {
 	dl := imgui.WindowDrawList()
 
-	uv0 := imgui.Vec2{X: float32(tab.rImageArea.Min.X) / float32(tab.tankmapTextureW), Y: float32(tab.rImageArea.Min.Y) / float32(tab.tankmapTextureH)}
-	uv1 := imgui.Vec2{X: float32(tab.rImageArea.Max.X) / float32(tab.tankmapTextureW), Y: float32(tab.rImageArea.Max.Y) / float32(tab.tankmapTextureH)}
+	// Draw areas and coordinate scales use a fixed tankmapSpace grid, so the
+	// texture behind them may be any size.
+	uv0 := imgui.Vec2{X: float32(tab.rImageArea.Min.X) / tankmapSpace, Y: float32(tab.rImageArea.Min.Y) / tankmapSpace}
+	uv1 := imgui.Vec2{X: float32(tab.rImageArea.Max.X) / tankmapSpace, Y: float32(tab.rImageArea.Max.Y) / tankmapSpace}
 	dlImage(dl, *tab.tankmapTexture, tab.imOutSp, tab.imOutSize, uv0, uv1)
 
 	sw := float64(tab.imOutSize.X / float32(tab.rImageArea.Dx()))
@@ -296,8 +317,8 @@ func (tab *MapViewTab) DrawView() {
 			// killerCoords := imgui.Vec2{}
 			// killerCoordsSet := false
 			for _, pos := range path {
-				x := (((float64(pos.X) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
-				z := ((2048 - (float64(pos.Z)-tab.rOffsets.TankMapCoord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
+				x := (((float64(pos.X) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
+				z := ((tankmapSpace - (float64(pos.Z)-tab.rOffsets.Coord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
 				coords = tab.imOutSp.Add(imgui.Vec2{X: float32(x), Y: float32(z)})
 				dl.PathLineToMergeDuplicate(coords)
 				if foundDeath != -1 && pos.Time >= tab.Kills.Kills[foundDeath].CurrentTime && !deathCoordsSet {
@@ -306,8 +327,8 @@ func (tab *MapViewTab) DrawView() {
 					// killerPos := tab.Kills.Kills[foundDeath].ResolvedKillerPosition
 					// if killerPos != nil {
 					// 	killerCoords = imgui.Vec2{
-					// 		X: float32((((float64(killerPos.X) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw),
-					// 		Y: float32((((float64(killerPos.Z) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw),
+					// 		X: float32((((float64(killerPos.X) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw),
+					// 		Y: float32((((float64(killerPos.Z) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw),
 					// 	}
 					// 	killerCoordsSet = true
 					// }
@@ -342,8 +363,8 @@ func (tab *MapViewTab) DrawView() {
 			if pos.Time >= tab.pbCurrentTime || pos.Time <= tab.pbCurrentTime-tab.pbTrailDuration {
 				continue
 			}
-			x := (((float64(pos.X) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
-			z := ((2048 - (float64(pos.Z)-tab.rOffsets.TankMapCoord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
+			x := (((float64(pos.X) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
+			z := ((tankmapSpace - (float64(pos.Z)-tab.rOffsets.Coord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
 			coords = tab.imOutSp.Add(imgui.Vec2{X: float32(x), Y: float32(z)})
 			dl.PathLineToMergeDuplicate(coords)
 			if foundDeath != -1 && pos.Time >= tab.Kills.Kills[foundDeath].CurrentTime && !deathCoordsSet {
@@ -352,8 +373,8 @@ func (tab *MapViewTab) DrawView() {
 				killerPos := tab.Kills.Kills[foundDeath].ResolvedKillerPosition
 				if killerPos != nil {
 					killerCoords = tab.imOutSp.Add(imgui.Vec2{
-						X: float32((((float64(killerPos.X) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw),
-						Y: float32(((2048 - (float64(killerPos.Z)-tab.rOffsets.TankMapCoord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh),
+						X: float32((((float64(killerPos.X) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw),
+						Y: float32(((tankmapSpace - (float64(killerPos.Z)-tab.rOffsets.Coord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh),
 					})
 					killerCoordsSet = true
 				}
@@ -401,8 +422,8 @@ func (tab *MapViewTab) DrawView() {
 	hpath := tab.Paths.Paths[tab.highlightPath]
 	if hpath != nil {
 		for _, pos := range hpath {
-			x := (((float64(pos.X) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
-			z := ((2048 - (float64(pos.Z)-tab.rOffsets.TankMapCoord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
+			x := (((float64(pos.X) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
+			z := ((tankmapSpace - (float64(pos.Z)-tab.rOffsets.Coord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
 			coords := imgui.Vec2{X: float32(x), Y: float32(z)}
 			dl.PathLineTo(tab.imOutSp.Add(coords))
 		}
@@ -411,8 +432,8 @@ func (tab *MapViewTab) DrawView() {
 	hpath = tab.Paths.Paths[tab.hoveredPath]
 	if hpath != nil && tab.hoveredPathRender {
 		for _, pos := range hpath {
-			x := (((float64(pos.X) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
-			z := ((2048 - (float64(pos.Z)-tab.rOffsets.TankMapCoord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
+			x := (((float64(pos.X) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
+			z := ((tankmapSpace - (float64(pos.Z)-tab.rOffsets.Coord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
 			coords := imgui.Vec2{X: float32(x), Y: float32(z)}
 			dl.PathLineTo(tab.imOutSp.Add(coords))
 		}
@@ -420,13 +441,13 @@ func (tab *MapViewTab) DrawView() {
 	}
 
 	// for _, k := range tab.Kills.Kills {
-	// 	x := (((float64(k.ResolvedVictimPositionX) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
-	// 	z := ((2048 - (float64(k.ResolvedVictimPositionZ)-tab.rOffsets.TankMapCoord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
+	// 	x := (((float64(k.ResolvedVictimPositionX) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
+	// 	z := ((2048 - (float64(k.ResolvedVictimPositionZ)-tab.rOffsets.Coord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
 	// 	coords := imgui.Vec2{X: float32(x), Y: float32(z)}
 	// 	dl.AddCircle(tab.imOutSp.Add(coords), 11, 0xFF0000FF)
 	// 	dl.AddCircle(tab.imOutSp.Add(coords), 13, 0xFF0000FF)
-	// 	x = (((float64(k.ResolvedKillerPositionX) - tab.rOffsets.TankMapCoord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
-	// 	z = ((2048 - (float64(k.ResolvedKillerPositionZ)-tab.rOffsets.TankMapCoord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
+	// 	x = (((float64(k.ResolvedKillerPositionX) - tab.rOffsets.Coord0[0]) / tab.rCoordScaleX) - float64(tab.rImageArea.Min.X)) * sw
+	// 	z = ((2048 - (float64(k.ResolvedKillerPositionZ)-tab.rOffsets.Coord0[1])/tab.rCoordScaleZ) - float64(tab.rImageArea.Min.Y)) * sh
 	// 	coords = imgui.Vec2{X: float32(x), Y: float32(z)}
 	// 	dl.AddCircle(tab.imOutSp.Add(coords), 11, 0xFF00FF00)
 	// 	dl.AddCircle(tab.imOutSp.Add(coords), 13, 0xFF00FF00)
@@ -442,6 +463,7 @@ func (tab *MapViewTab) runGeneral() {
 	imgui.TextUnformatted("Level settings: " + tab.rLevelSettings)
 	imgui.TextUnformatted("Battle type: " + tab.rBattleType)
 	imgui.TextUnformatted("Main area: " + tab.rMainAreaName)
+	imgui.TextUnformatted(fmt.Sprint("Map kind: ", tab.rMapKind))
 	imgui.TextUnformatted(fmt.Sprint("Offsets: ", tab.rOffsets))
 	imgui.TextUnformatted(fmt.Sprint("Image area: ", tab.rImageArea))
 	imgui.TextUnformatted(fmt.Sprint("Image width: ", tab.rImageArea.Dx()))

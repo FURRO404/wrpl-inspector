@@ -48,7 +48,7 @@ func BlkNeedsNameMap(input []byte) (bool, error) {
 	case 0x04: // SLIM_ZSTD
 		return true, nil
 	case 0x05: // SLIM_ZSTD_DICT
-		return false, errors.New("SLIM_ZSTD_DICT BLK not supported (requires dictionary and external name map)")
+		return true, nil
 	case 0x00: // BBF legacy
 		return false, errors.New("BBF BLK not supported")
 	default:
@@ -59,6 +59,13 @@ func BlkNeedsNameMap(input []byte) (bool, error) {
 // ParseBlkWithNameMap is ParseBlk that also accepts an optional external name
 // map, which SLIM and SLIM_ZSTD BLKs reference instead of embedding one.
 func ParseBlkWithNameMap(input []byte, nameMap []string) (ret map[string]any, err error) {
+	return ParseBlkWithNameMapDict(input, nameMap, nil)
+}
+
+// ParseBlkWithNameMapDict is ParseBlkWithNameMap that also accepts the shared
+// zstd dictionary a SLIM_ZSTD_DICT BLK is compressed against. A vromfs image
+// stores that dictionary next to its name map; see VROMFS.Dict.
+func ParseBlkWithNameMapDict(input []byte, nameMap []string, dict []byte) (ret map[string]any, err error) {
 	if len(input) == 0 {
 		return nil, errors.New("empty BLK buffer")
 	}
@@ -106,7 +113,22 @@ func ParseBlkWithNameMap(input []byte, nameMap []string) (ret map[string]any, er
 		}
 		return parseFatBlk(out, nameMap)
 	case 0x05: // SLIM_ZSTD_DICT
-		return nil, errors.New("SLIM_ZSTD_DICT BLK not supported (requires dictionary and external name map)")
+		if nameMap == nil {
+			return nil, errors.New("SLIM_ZSTD_DICT BLK is not supported without an external name map")
+		}
+		if dict == nil {
+			return nil, errors.New("SLIM_ZSTD_DICT BLK is not supported without its zstd dictionary")
+		}
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(dict))
+		if err != nil {
+			return nil, fmt.Errorf("SLIM_ZSTD_DICT: new zstd reader: %w", err)
+		}
+		defer dec.Close()
+		out, err := dec.DecodeAll(input[1:], nil)
+		if err != nil {
+			return nil, fmt.Errorf("SLIM_ZSTD_DICT: decode: %w", err)
+		}
+		return parseFatBlk(out, nameMap)
 	case 0x00: // BBF legacy
 		return nil, errors.New("BBF BLK not supported")
 	default:

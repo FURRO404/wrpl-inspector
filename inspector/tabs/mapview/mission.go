@@ -9,25 +9,52 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/maxsupermanhd/wrpl-inspector/v3/wtcontent"
 )
+
+// tankmapSpace is the grid that draw areas and coordinate scales use. It is
+// independent of the size of the map picture.
+const tankmapSpace = 2048
 
 type MissionDef struct {
 	Areas   map[string]AreaDef `json:"areas"`
 	Imports map[string]any     `json:"imports"`
 }
 
-func missionLoad(dataminePath, missionPath string) (*MissionDef, error) {
+// blkTo converts a parsed BLK into one of the definition structs. The BLK
+// values match the JSON the datamine repository holds, so the struct tags fit
+// both sources.
+func blkTo(blk map[string]any, out any) error {
+	b, err := json.Marshal(blk)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
+}
+
+func missionLoad(inst *wtcontent.Install, dataminePath, missionPath string) (*MissionDef, error) {
 	if missionPath == "" {
 		return nil, nil
 	}
-	missionBytes, err := os.ReadFile(filepath.Join(dataminePath, strings.ToLower(`mis.vromfs.bin_u/`+missionPath+"x")))
-	if err != nil {
-		return nil, err
-	}
 	var mission *MissionDef
-	err = json.Unmarshal(missionBytes, &mission)
-	if err != nil {
-		return nil, err
+	if inst != nil {
+		blk, err := inst.Blk("mis.vromfs.bin", strings.ToLower(missionPath))
+		if err == nil {
+			mission = &MissionDef{}
+			if err := blkTo(blk, mission); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if mission == nil {
+		missionBytes, err := os.ReadFile(filepath.Join(dataminePath, strings.ToLower(`mis.vromfs.bin_u/`+missionPath+"x")))
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(missionBytes, &mission); err != nil {
+			return nil, err
+		}
 	}
 	if mission == nil {
 		return nil, errors.New("json unmarshal nil")
@@ -44,7 +71,7 @@ func missionLoad(dataminePath, missionPath string) (*MissionDef, error) {
 		if !ok {
 			return nil, errors.New("import record has no file path")
 		}
-		impMis, err := missionLoad(dataminePath, fp)
+		impMis, err := missionLoad(inst, dataminePath, fp)
 		if err != nil {
 			return nil, fmt.Errorf("importing %q: %w", fp, err)
 		}
@@ -65,7 +92,7 @@ func missionLoad(dataminePath, missionPath string) (*MissionDef, error) {
 			if !ok {
 				return nil, fmt.Errorf("import record %d has no file path", i)
 			}
-			impMis, err := missionLoad(dataminePath, fp)
+			impMis, err := missionLoad(inst, dataminePath, fp)
 			if err != nil {
 				return nil, fmt.Errorf("importing %q: %w", fp, err)
 			}
@@ -78,20 +105,61 @@ func missionLoad(dataminePath, missionPath string) (*MissionDef, error) {
 }
 
 type levelDef struct {
+	// Each minimap picture has its own coordinate pair. The ground picture
+	// covers the tank battle area; the air picture covers the whole level.
+	MapCoord0     []float64 `json:"mapCoord0"`
+	MapCoord1     []float64 `json:"mapCoord1"`
 	TankMapCoord0 []float64 `json:"tankMapCoord0"`
 	TankMapCoord1 []float64 `json:"tankMapCoord1"`
+
+	// Coord0 and Coord1 are the pair that matches the picture in use. Call
+	// useMap to set them.
+	Coord0 []float64 `json:"-"`
+	Coord1 []float64 `json:"-"`
 }
 
-func getLevelCoords(dataminePath, levelPath string) (*levelDef, error) {
-	levelPath = filepath.Join(dataminePath, `aces.vromfs.bin_u/`+strings.TrimSuffix(levelPath, ".bin")+".blkx")
-	levelBytes, err := os.ReadFile(levelPath)
+// coordsFor returns the coordinate pair a picture kind uses. It reports false
+// when the level does not describe that kind.
+func (l levelDef) coordsFor(kind wtcontent.MapKind) (c0, c1 []float64, ok bool) {
+	c0, c1 = l.MapCoord0, l.MapCoord1
+	if kind == wtcontent.MapGround {
+		c0, c1 = l.TankMapCoord0, l.TankMapCoord1
+	}
+	if len(c0) < 2 || len(c1) < 2 {
+		return nil, nil, false
+	}
+	return c0, c1, true
+}
+
+// useMap points Coord0 and Coord1 at the pair the given picture kind uses. It
+// reports false when the level does not describe that kind.
+func (l *levelDef) useMap(kind wtcontent.MapKind) bool {
+	c0, c1, ok := l.coordsFor(kind)
+	if !ok {
+		return false
+	}
+	l.Coord0, l.Coord1 = c0, c1
+	return true
+}
+
+func getLevelCoords(inst *wtcontent.Install, dataminePath, levelPath string) (*levelDef, error) {
+	var level levelDef
+	if inst != nil {
+		blk, err := inst.Blk("aces.vromfs.bin", strings.TrimSuffix(levelPath, ".bin")+".blk")
+		if err == nil {
+			if err := blkTo(blk, &level); err != nil {
+				return nil, fmt.Errorf("parsing level %q: %w", levelPath, err)
+			}
+			return &level, nil
+		}
+	}
+	p := filepath.Join(dataminePath, `aces.vromfs.bin_u/`+strings.TrimSuffix(levelPath, ".bin")+".blkx")
+	levelBytes, err := os.ReadFile(p)
 	if err != nil {
 		return nil, err
 	}
-	var level levelDef
-	err = json.Unmarshal(levelBytes, &level)
-	if err != nil {
-		return nil, fmt.Errorf("parsing level %q: %w", levelPath, err)
+	if err := json.Unmarshal(levelBytes, &level); err != nil {
+		return nil, fmt.Errorf("parsing level %q: %w", p, err)
 	}
 	return &level, nil
 }
@@ -251,15 +319,15 @@ func findMainBattleArea(areas map[string]AreaDef, bttlType string, difficulty by
 }
 
 func calcDrawArea(offsets *levelDef, area *AreaDef, makeSquare bool) (x, z, w, h float64) {
-	areaSizeX := math.Abs(offsets.TankMapCoord1[0] - offsets.TankMapCoord0[0])
-	areaSizeZ := math.Abs(offsets.TankMapCoord1[1] - offsets.TankMapCoord0[1])
-	coordScaleX := areaSizeX / 2048
-	coordScaleZ := areaSizeZ / 2048
-	x = float64(area.TM[3][0]) - offsets.TankMapCoord0[0]
-	z = float64(area.TM[3][2]) - offsets.TankMapCoord0[1]
+	areaSizeX := math.Abs(offsets.Coord1[0] - offsets.Coord0[0])
+	areaSizeZ := math.Abs(offsets.Coord1[1] - offsets.Coord0[1])
+	coordScaleX := areaSizeX / tankmapSpace
+	coordScaleZ := areaSizeZ / tankmapSpace
+	x = float64(area.TM[3][0]) - offsets.Coord0[0]
+	z = float64(area.TM[3][2]) - offsets.Coord0[1]
 	x /= coordScaleX
 	z /= coordScaleZ
-	z = 2048 - z
+	z = tankmapSpace - z
 	w = float64(area.TM[0][0] + area.TM[0][2])
 	h = float64(area.TM[2][0] + area.TM[2][2])
 	w /= coordScaleX

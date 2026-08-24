@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -31,6 +32,7 @@ import (
 	packetkill "github.com/maxsupermanhd/wrpl-inspector/v3/wrpl/packet/parser/kill"
 	packetmovement "github.com/maxsupermanhd/wrpl-inspector/v3/wrpl/packet/parser/movement"
 	packetslot "github.com/maxsupermanhd/wrpl-inspector/v3/wrpl/packet/parser/slot"
+	"github.com/maxsupermanhd/wrpl-inspector/v3/wtcontent"
 )
 
 var (
@@ -103,6 +105,13 @@ func replayProcessor(rpl *inspector.LoadedReplay) ([]packet.PacketParser, []insp
 	tabs = append(tabs, tabBitshift.NewBitShiftUI())
 	tabs = append(tabs, tabPlayers.NewPlayersUI(rpl, slot))
 	tabs = append(tabs, tabKills.NewKillsTab(kills, &ecs.Mgr, slot))
+	// A local War Thunder installation supplies the map picture and the level
+	// and mission definitions. Without one the map view falls back to the
+	// cache directory and the datamine checkout below.
+	wtInstall, err := wtcontent.FindInstall()
+	if err != nil {
+		log.Println("no War Thunder installation:", err)
+	}
 	tabs = append(tabs, &tabMapview.MapViewTab{
 		Backend:      ui.ImBackend,
 		Rpl:          rpl,
@@ -111,6 +120,7 @@ func replayProcessor(rpl *inspector.LoadedReplay) ([]packet.PacketParser, []insp
 		Players:      slot,
 		Paths:        paths,
 		CameraAngles: cameraAngles,
+		Install:      wtInstall,
 		TankMapsPath: "../../data/tankmaps",
 		DataminePath: "../../../War-Thunder-Datamine/",
 	})
