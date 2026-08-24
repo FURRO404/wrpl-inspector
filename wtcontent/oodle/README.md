@@ -57,8 +57,8 @@ chunk type (Huffman with both code length encodings, TANS, RLE, recursive,
 multi array), both Kraken literal modes, both Mermaid modes, and all six
 Leviathan literal modes in both single command and multi command form.
 
-The decoder was also checked against 488 streams taken from a War Thunder
-install (`.ddsx`, `.grp`, `.dxp.bin`, `levels/*.bin`). Every one decodes
+The decoder was also checked against 400 full length streams taken from a War
+Thunder install (`.ddsx`, `.grp`, `.dxp.bin`, `levels/*.bin`). Every one decodes
 byte-for-byte the same as the C original. Those assets are compressed almost
 entirely with Leviathan; Kraken appears rarely and Mermaid and Selkie not at
 all.
@@ -80,7 +80,8 @@ all.
 ## A note on memory
 
 The format is built around loads and stores that run past the end of a buffer.
-Every buffer here carries 128 bytes of slack after its logical end, and every
-sub-slice keeps the capacity of its parent, so those reads and writes stay
-inside the same array. Reads before the start of a buffer return zero, and the
-bits that come from there are always shifted away again.
+Every buffer here carries 128 bytes of slack inside its own length, so those
+reads and writes stay in the same array. Streams are held as a whole buffer plus
+an index, never as a sub-slice, so the slack stays reachable. Reads before the
+start of a buffer return zero, and the bits that come from there are always
+shifted away again.
